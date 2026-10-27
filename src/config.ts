@@ -228,6 +228,14 @@ export interface RepetitionGuardConfig {
  * Adapter configuration. Maps onto acp-kernel's `Config` plus Pi-specific knobs
  *  (live model context window, protected tools, state persistence).
  */
+export interface SummarizerConfig {
+  enabled?: boolean;
+  model?: string;
+  thinking?: string;
+  fallbackModels?: string[];
+  timeoutMs?: number;
+}
+
 export interface AdapterConfig {
   /** Master switch. Default: true. Set `enabled: false` in acp.json (or
    *  programmatically) to turn the whole adapter off — no tools, no system
@@ -303,6 +311,8 @@ export interface AdapterConfig {
    *  `{ enabled: true }`, `false` → `{ enabled: false }`) or a DelegateConfig
    *  object. Default: enabled. */
   delegate?: boolean | DelegateConfig;
+  /** Optional independent model used to generate compression summaries. */
+  summarizer?: SummarizerConfig;
   /** Compression tuning. */
   compress?: CompressConfig;
   /** Provider token-throttle (Bedrock "Too many tokens, please wait before

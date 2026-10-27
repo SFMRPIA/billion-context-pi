@@ -16,15 +16,20 @@ import { countUnicodeEscapes, findUnverifiableUserQuote, sanitizeSummary } from 
 import { assertNotAborted } from "./abort.js";
 import { getSystemPromptText } from "./compat.js";
 import { UNSUPPORTED_HOST_MESSAGE } from "./omp.js";
+import { buildSummarizerTargets, currentSummarizerThinking, enabledSummarizerConfig, generateExternalSummary, runWithFallback, safeDiagnostic, summarizeRangeText, type SummarizerResult, isExternalSummarizerEnabled } from "./summarizer.js";
 
 function formatK(n: number): string {
   return n >= 1000 ? `${(n / 1000).toFixed(1)}K` : String(n);
 }
 
+function contextModelRef(model: ExtensionContext["model"]): string | undefined {
+  return model ? `${model.provider}/${model.id}` : undefined;
+}
+
 const RangeSpec = Type.Object({
   startId: Type.String({ description: 'Message ref, e.g. "m00005" (from the acp tag), or a block id "b3".' }),
   endId: Type.String({ description: 'Inclusive end ref. Must be at or after startId.' }),
-  summary: Type.String({ description: "Complete technical summary replacing all content in range. Keep only essential details (conclusions, file paths, decisions, exact values, etc.)." }),
+  summary: Type.Optional(Type.String({ description: "Required when the external summarizer is disabled; optional when it is enabled in acp.json." })),
   topic: Type.Optional(Type.String({ description: "Short label (3-5 words) for THIS range, e.g. 'Auth System Exploration'. Omit to use top-level topic. When compressing multiple unrelated ranges, give each its own topic for better quality." })),
 });
 
@@ -39,7 +44,7 @@ const CompressParams = Type.Object({
     // only compress attempt was lost. Accept the JSON-encoded form and parse
     // it in normalizeRanges below.
     Type.String({ description: "JSON-encoded array of ranges — accepted because non-strict-tool providers sometimes stringify array arguments; parsed automatically." }),
-  ], { description: "One or more ranges to compress, each with start/end boundaries and a summary. When compressing multiple unrelated ranges in one call, give each its own topic." }),
+  ], { description: "One or more ranges to compress, each with start/end boundaries and a summary unless the external summarizer is enabled. When compressing multiple unrelated ranges in one call, give each its own topic." }),
   summaryMaxChars: Type.Optional(Type.Number({ description: "Override max summary length (default max: 20000 chars). Use when content is important and needs more detail — don't lose critical info just to fit the limit." })),
 });
 
@@ -50,12 +55,12 @@ export function makeCompressTool(runtime: AcpRuntime, overrides?: ToolPromptOver
     name: "compress",
     label: "Compress",
     description:
-      "Replace older conversation ranges with detailed summaries you write. Single range: compress({ content: [{ startId, endId, summary }] }). Batch: compress({ content: [{ topic, startId, endId, summary }, ...] }) — each entry gets its own summary.",
-    promptSnippet: "compress({ content: [{ startId, endId, summary }] }) or batch multiple ranges",
+      "Replace older conversation ranges with summaries. Include summary unless the external summarizer is enabled in acp.json. Single range: compress({ content: [{ startId, endId, summary? }] }). Batch: compress({ content: [{ topic, startId, endId, summary? }, ...] }).",
+    promptSnippet: "compress({ content: [{ startId, endId, summary? }] }) or batch multiple ranges",
     promptGuidelines: [
       "Each message has an acp tag with its mNNNNN ref, token size, and type. Compress ranges by their refs.",
-      "Batch multiple unrelated ranges in one call — each gets its own topic and summary.",
-      "Write dense, self-contained summaries — preserve file paths, signatures, errors, and decisions verbatim.",
+      "Batch multiple unrelated ranges in one call — each gets its own topic.",
+      "When external summarization is enabled, select ranges and topics only; otherwise write dense, self-contained summaries preserving file paths, signatures, errors, and decisions verbatim.",
       "Never compress content the current step is actively using.",
     ],
     parameters: CompressParams,
@@ -82,12 +87,13 @@ type RangeEntry = Static<typeof RangeSpec>;
 // the failure cap (a returned string would land as isError:false and count
 // as neutral). An empty array passes through (the call site returns "No
 // ranges provided.").
-export function normalizeRanges(args: CompressArgs): RangeEntry[] | string {
-  const effective = repairContentTail(repairBareRangeObjects(args));
+export function normalizeRanges(args: CompressArgs, allowMissingSummary = false): RangeEntry[] | string {
+  const repaired = repairContentTail(repairBareRangeObjects(args, allowMissingSummary));
+  const effective = allowMissingSummary ? supplyExternalSummaryPlaceholders(repaired) : repaired;
   const { ranges, diagnostics } = parseCompressArgs(effective);
   if (ranges.length === 0) {
     if (Array.isArray(effective.content) && effective.content.length === 0) return [];
-    return describeDiagnostics(diagnostics, effective.content);
+    return describeDiagnostics(diagnostics, effective.content, allowMissingSummary);
   }
   return ranges.map((r) => ({ startId: r.startRef, endId: r.endRef, summary: r.summary, topic: r.topic }));
 }
@@ -130,9 +136,9 @@ export function tailRepair(s: string): string | undefined {
 // misleading "must be an ARRAY" / "failed to parse" diagnostic that the model
 // cannot act on (#480). Extract the top-level objects and re-wrap them as a
 // proper array before delegating.
-function repairBareRangeObjects(args: CompressArgs): CompressArgs {
+function repairBareRangeObjects(args: CompressArgs, allowMissingSummary = false): CompressArgs {
   if (typeof args.content !== "string") return args;
-  const repaired = arrayWrapRepair(args.content);
+  const repaired = arrayWrapRepair(args.content, allowMissingSummary);
   return repaired === undefined ? args : { ...args, content: repaired };
 }
 
@@ -140,7 +146,7 @@ function repairBareRangeObjects(args: CompressArgs): CompressArgs {
 // (outside strings), keep those that validate as range specs, and return them
 // as a JSON array string. Returns undefined when nothing range-shaped is
 // found at top level, leaving accurate error reporting to the normal path.
-export function arrayWrapRepair(s: string): string | undefined {
+export function arrayWrapRepair(s: string, allowMissingSummary = false): string | undefined {
   const objects = extractTopLevelObjects(s)
     .map((candidate): unknown => {
       try {
@@ -149,7 +155,7 @@ export function arrayWrapRepair(s: string): string | undefined {
         return undefined;
       }
     })
-    .filter((o): o is Record<string, unknown> => isRangeLikeObject(o));
+    .filter((o): o is Record<string, unknown> => isRangeLikeObject(o, allowMissingSummary));
   if (objects.length === 0) return undefined;
   return JSON.stringify(objects);
 }
@@ -198,15 +204,37 @@ function extractTopLevelObjects(s: string): string[] {
 
 // Same field aliases the kernel's validateEntry accepts — the repair must not
 // reject shapes the parser would have accepted.
-function isRangeLikeObject(o: unknown): o is Record<string, unknown> {
+function isRangeLikeObject(o: unknown, allowMissingSummary = false): o is Record<string, unknown> {
   if (o === null || typeof o !== "object" || Array.isArray(o)) return false;
   const r = o as Record<string, unknown>;
   const hasStart = typeof r.startId === "string" || typeof r.startRef === "string" || typeof r.messageId === "string";
   const hasEnd = typeof r.endId === "string" || typeof r.endRef === "string" || typeof r.messageId === "string";
-  return hasStart && hasEnd && typeof r.summary === "string" && r.summary.length > 0;
+  const hasSummary = typeof r.summary === "string" && r.summary.length > 0;
+  return hasStart && hasEnd && (allowMissingSummary || hasSummary);
 }
 
-function describeDiagnostics(diagnostics: CompressParseDiagnostics, content: CompressArgs["content"]): string {
+const EXTERNAL_SUMMARY_PLACEHOLDER = "External summarizer will generate this replacement summary before compression.";
+
+function supplyExternalSummaryPlaceholders(args: CompressArgs): CompressArgs {
+  if (Array.isArray(args.content)) {
+    return { ...args, content: args.content.map((range) => ({ ...range, summary: EXTERNAL_SUMMARY_PLACEHOLDER })) };
+  }
+  if (typeof args.content !== "string") return args;
+  try {
+    const parsed: unknown = JSON.parse(args.content);
+    if (!Array.isArray(parsed)) return args;
+    return {
+      ...args,
+      content: JSON.stringify(parsed.map((range) => range && typeof range === "object" && !Array.isArray(range)
+        ? { ...range, summary: EXTERNAL_SUMMARY_PLACEHOLDER }
+        : range)),
+    };
+  } catch {
+    return args;
+  }
+}
+
+function describeDiagnostics(diagnostics: CompressParseDiagnostics, content: CompressArgs["content"], allowMissingSummary = false): string {
   const shape = typeof content === "string"
     ? "a JSON-encoded string (non-strict-tool providers stringify array arguments)"
     : content === null ? "null" : `a ${typeof content}`;
@@ -215,13 +243,15 @@ function describeDiagnostics(diagnostics: CompressParseDiagnostics, content: Com
     return `${base}; the input was truncated and no complete ranges could be recovered. Shorten the summary or split into smaller ranges.`;
   }
   if (diagnostics.invalidItems > 0) {
-    return `${base}; ${diagnostics.invalidItems} entr${diagnostics.invalidItems === 1 ? "y was" : "ies were"} dropped as invalid. Each range must be an object with string fields startId, endId, summary.`;
+    const fields = allowMissingSummary ? "startId, endId" : "startId, endId, summary";
+    return `${base}; ${diagnostics.invalidItems} entr${diagnostics.invalidItems === 1 ? "y was" : "ies were"} dropped as invalid. Each range must be an object with string fields ${fields}.`;
   }
   const parseErr = jsonParseError(content);
   if (parseErr !== undefined) {
     return `${base}; the JSON failed to parse: ${parseErr}. Fix the malformed JSON (e.g. a missing closing brace or quote) and retry.`;
   }
-  return `${base}. content must be an ARRAY of {startId, endId, summary} objects.`;
+  const fields = allowMissingSummary ? "startId, endId" : "startId, endId, summary";
+  return `${base}. content must be an ARRAY of {${fields}} objects.`;
 }
 
 // Short diagnostic for why a JSON-shaped string fails to parse, or undefined
@@ -436,25 +466,30 @@ function tier3OnlyRewrite(newBlocks: CompressionBlock[], allBlocks: CompressionB
 // message-type ranges. When the session's actionable mass is tier blocks, name
 // them so repetition-prone models get a concrete next action instead of
 // hunting (and re-hitting the guard).
-export function tierReadyHint(state: CompressionState, config: ReturnType<AcpRuntime["configFor"]>): string {
+export function tierReadyHint(state: CompressionState, config: ReturnType<AcpRuntime["configFor"]>, externalSummarizerEnabled = false): string {
   if (!config.tiers.enabled) return "";
   const active = state.blocks.filter((b) => b.active);
   const first = (bs: CompressionBlock[]) => bs[0]?.blockId ?? "";
   const last = (bs: CompressionBlock[]) => bs[bs.length - 1]?.blockId ?? "";
   const t2 = active.filter((b) => b.tier === 2);
   if (t2.length >= config.tiers.tier3Trigger) {
-    return `Actionable now: condense tier-2 blocks ${first(t2)}..${last(t2)} into a single tier-3 block (compress({ content: [{ startId: "${first(t2)}", endId: "${last(t2)}", summary: "..." }] })).`;
+    const summaryArg = externalSummarizerEnabled ? "" : ', summary: "..."';
+    return `Actionable now: condense tier-2 blocks ${first(t2)}..${last(t2)} into a single tier-3 block (compress({ content: [{ startId: "${first(t2)}", endId: "${last(t2)}"${summaryArg} }] })).`;
   }
   const t1 = active.filter((b) => b.tier === 1);
   if (t1.length >= config.tiers.tier2Trigger) {
-    return `Actionable now: distill tier-1 blocks ${first(t1)}..${last(t1)} into a single tier-2 block (compress({ content: [{ startId: "${first(t1)}", endId: "${last(t1)}", summary: "..." }] })).`;
+    const summaryArg = externalSummarizerEnabled ? "" : ', summary: "..."';
+    return `Actionable now: distill tier-1 blocks ${first(t1)}..${last(t1)} into a single tier-2 block (compress({ content: [{ startId: "${first(t1)}", endId: "${last(t1)}"${summaryArg} }] })).`;
   }
   return "";
 }
 
 async function handleCompress(args: CompressArgs, runtime: AcpRuntime, ctx: ExtensionContext, toolCallId?: string, signal?: AbortSignal): Promise<string> {
   assertNotAborted(signal);
-  const maybeRanges = normalizeRanges(args);
+  const summarizerConfig = enabledSummarizerConfig(runtime.adapter);
+  if (!summarizerConfig.ok) throw new Error(summarizerConfig.error);
+  const useExternalSummarizer = summarizerConfig.value.enabled;
+  const maybeRanges = normalizeRanges(args, useExternalSummarizer);
   // Argument errors throw (not return): pi-agent-core only sets isError:true
   // on THROWN tool errors, and the failure counter keys off isError. A
   // returned string would land as isError:false — neutral, so it neither
@@ -488,18 +523,6 @@ async function handleCompress(args: CompressArgs, runtime: AcpRuntime, ctx: Exte
   // Issue #309: normalize at ingest — the kernel stores/renders summaries
   // verbatim, so double-escaped \uXXXX runs would persist into every future
   // prompt. Unverifiable user-quote claims are logged as evidence only.
-  const sanitizedRanges = ranges.map((r) => {
-    const span = `${r.startId}..${r.endId}`;
-    const s = sanitizeSummary(r.summary);
-    if (s.unescaped) {
-      debug.event("compress", { sid, event: "summary-unescaped", span, escapes: countUnicodeEscapes(r.summary), beforeLen: r.summary.length, afterLen: s.text.length });
-    }
-    const unverifiedQuote = findUnverifiableUserQuote(s.text);
-    if (unverifiedQuote !== null) {
-      logWarn("compress", { sid, event: "summary-unverifiable-quote", span, claim: unverifiedQuote });
-    }
-    return s.text === r.summary ? r : { ...r, summary: s.text };
-  });
   // #453: stable persisted-boundary key — must match the key the context
   // transform records outcomes under (retryBreakerKey); a merged-view key
   // churns under fork hosts and would never see the latched cap.
@@ -519,12 +542,89 @@ async function handleCompress(args: CompressArgs, runtime: AcpRuntime, ctx: Exte
   const beforeTokens = estimateTokens(messages, collectCoveredMessageIds(state), imageTokens);
   const summaryMaxChars = args.summaryMaxChars;
   const topLevelTopic = args.topic;
+  const maxSummaryChars = summaryMaxChars ?? config.compress.maxSummaryLength;
+  const minSummaryChars = config.compress.minSummaryLength;
+  const rangesToApply: Array<RangeEntry & { summary: string }> = [];
+  const summarizerResults: SummarizerResult[] = [];
+  const summarizerFailures: string[] = [];
+  let lastRangeError: unknown;
+
+  if (useExternalSummarizer) {
+    const startSessionId = sid;
+    const startModelRef = contextModelRef(ctx.model);
+    const startThinking = ctx.thinkingLevel;
+    const targets = buildSummarizerTargets(summarizerConfig.value, startModelRef ? { modelRef: startModelRef, thinking: currentSummarizerThinking(ctx) } : undefined);
+    const assertCurrentContext = (): void => {
+      if (ctx.sessionManager.getSessionId() !== startSessionId || contextModelRef(ctx.model) !== startModelRef || ctx.thinkingLevel !== startThinking) {
+        throw new Error("Session or active model changed while summarization was running; generated summaries were discarded.");
+      }
+    };
+    for (const range of ranges) {
+      assertNotAborted(signal);
+      assertCurrentContext();
+      const span = `${range.startId}..${range.endId}`;
+      try {
+        const probe = runtime.core.applyCompression({
+          ranges: [{ startRef: range.startId, endRef: range.endId, summary: EXTERNAL_SUMMARY_PLACEHOLDER, topic: range.topic ?? topLevelTopic, summaryMaxChars, compressCallId: toolCallId }],
+          messages,
+          state: structuredClone(state),
+          config,
+        });
+        if (probe.result.errors.length > 0 || probe.result.blocksCreated === 0) {
+          throw new Error(probe.result.errors[0] ?? "The range is not compressible.");
+        }
+        const source = summarizeRangeText(range, messages, state);
+        const attempt = await runWithFallback(targets, (target) => generateExternalSummary({
+          context: ctx,
+          target,
+          sourceText: source.text,
+          tier: source.tier,
+          rules: { t1: runtime.prompts.howToCompressRules, t2: runtime.prompts.tier2DistillRules, t3: runtime.prompts.tier3CondenseRules },
+          timeoutMs: summarizerConfig.value.timeoutMs,
+          maxSummaryChars,
+          minSummaryChars,
+          signal,
+        }), signal);
+        assertCurrentContext();
+        rangesToApply.push({ ...range, summary: attempt.value.summary });
+        summarizerResults.push({ ...attempt.value, fallbackReason: attempt.fallbackReason });
+        if (attempt.fallbackReason) logWarn("summarizer", { sid, event: "fallback-used", primary: targets[0]?.modelRef, model: attempt.target.modelRef, reason: attempt.fallbackReason });
+        logInfo("summarizer", { sid, event: "generated", span, model: attempt.target.modelRef, thinking: attempt.target.thinking ?? null, inputTokens: attempt.value.usage?.input ?? null, outputTokens: attempt.value.usage?.output ?? null, cost: attempt.value.usage?.cost ?? null });
+      } catch (error) {
+        if (signal?.aborted) throw error;
+        if (error instanceof Error && error.message.startsWith("Session or active model changed")) throw error;
+        summarizerFailures.push(span);
+        lastRangeError = error;
+        logWarn("summarizer", { sid, event: "range-failed", span, errorType: error instanceof Error ? error.name : typeof error, error: safeDiagnostic(error) });
+      }
+    }
+    assertCurrentContext();
+    if (rangesToApply.length === 0) {
+      const failed = summarizerFailures.length ? ` Failed ranges: ${summarizerFailures.join(", ")}.` : "";
+      throw new Error(`No ranges were compressed by the external summarizer.${failed} Last error: ${safeDiagnostic(lastRangeError)}`);
+    }
+  } else {
+    for (const range of ranges) {
+      if (typeof range.summary !== "string" || range.summary.length === 0) throw new Error(`Range ${range.startId}..${range.endId} requires a summary when external summarization is disabled.`);
+      rangesToApply.push({ ...range, summary: range.summary });
+    }
+  }
+
+  // The kernel stores summaries verbatim, so sanitize both model-written and external summaries before apply.
+  const sanitizedRanges = rangesToApply.map((r) => {
+    const span = `${r.startId}..${r.endId}`;
+    const s = sanitizeSummary(r.summary);
+    if (s.unescaped) debug.event("compress", { sid, event: "summary-unescaped", span, escapes: countUnicodeEscapes(r.summary), beforeLen: r.summary.length, afterLen: s.text.length });
+    const unverifiedQuote = findUnverifiableUserQuote(s.text);
+    if (unverifiedQuote !== null) logWarn("compress", { sid, event: "summary-unverifiable-quote", span, claim: unverifiedQuote });
+    return s.text === r.summary ? r : { ...r, summary: s.text };
+  });
 
   debug.event("compress-in", {
     sid: ctx.sessionManager.getSessionId(),
     modelId,
-    ranges: ranges.length,
-    spans: ranges.map((r) => ({ span: `${r.startId}..${r.endId}`, summaryLen: r.summary.length, summary: r.summary, topic: r.topic ?? topLevelTopic ?? null })),
+    ranges: rangesToApply.length,
+    spans: rangesToApply.map((r) => ({ span: `${r.startId}..${r.endId}`, summaryLen: r.summary.length, summary: r.summary, topic: r.topic ?? topLevelTopic ?? null })),
     blocksBefore: state.blocks.length,
     activeBefore: state.blocks.filter((b) => b.active).length,
     beforeMsgCount: messages.length,
@@ -554,7 +654,7 @@ async function handleCompress(args: CompressArgs, runtime: AcpRuntime, ctx: Exte
       event: "tier3-rewrite-rejected",
       spans: rewriteSpans,
     });
-    const hint = tierReadyHint(state, config);
+    const hint = tierReadyHint(state, config, useExternalSummarizer);
     throw new Error(
       `Range ${rewriteSpans.join(", ")} only re-condenses terminal tier-3 block(s) — T3 is the highest tier, so rewriting it reclaims nothing and can repeat forever (dog/billion-context-pi#3). Nothing was compressed. ` +
         (hint ? `${hint} ` : "") +
@@ -652,6 +752,11 @@ async function handleCompress(args: CompressArgs, runtime: AcpRuntime, ctx: Exte
   }
   if (warnings.length > 0) lines.push("⚠️ " + warnings.join("; "));
   if (errors.length > 0) lines.push("Errors: " + errors.join("; "));
+  if (summarizerResults.length > 0) {
+    const models = [...new Set(summarizerResults.map((result) => result.target.modelRef))];
+    lines.push(`External summarizer models: ${models.join(", ")}.`);
+  }
+  if (summarizerFailures.length > 0) lines.push(`External summarizer failed ranges (not compressed): ${summarizerFailures.join(", ")}.`);
   // #420: carry the post-compression snapshot so a same-turn follow-up
   // compress has its refs without a planning acp_status call. Computed from
   // afterTurn (processTurn over the applied state), so the list reflects

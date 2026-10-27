@@ -226,6 +226,7 @@ test("applyUserConfig supports all user config keys", () => {
     toolBashDefaultTimeout: 120,
     toolOutputMaxBytes: 100_000,
     outputHeadroomMaxPct: 0.1,
+    summarizer: { enabled: true, model: "vendor/model", fallbackModels: ["current"] },
     rules: true,
   };
   const result = applyUserConfig(adapter, user);
@@ -236,7 +237,20 @@ test("applyUserConfig supports all user config keys", () => {
   assert.equal(result.toolBashDefaultTimeout, 120);
   assert.equal(result.toolOutputMaxBytes, 100_000);
   assert.equal(result.outputHeadroomMaxPct, 0.1);
+  assert.deepEqual(result.summarizer, { enabled: true, model: "vendor/model", fallbackModels: ["current"] });
   assert.equal(result.rules, true);
+});
+
+test("loadUserConfig picks up summarizer settings from acp.json", async () => {
+  const tmpDir = path.join(os.tmpdir(), `acp-test-summarizer-${Date.now()}`);
+  await fs.mkdir(tmpDir, { recursive: true });
+  try {
+    const summarizer = { enabled: true, model: "vendor/model", fallbackModels: ["vendor/backup", "current"] };
+    await writeConfig(tmpDir, { summarizer });
+    assert.deepEqual((await loadUserConfig(tmpDir)).summarizer, summarizer);
+  } finally {
+    await fs.rm(tmpDir, { recursive: true, force: true });
+  }
 });
 
 test("loadUserConfig picks up protection keys from acp.json", async () => {

@@ -44,6 +44,8 @@ test("tierReadyHint still fires when triggers are explicitly configured low", ()
     const config = defaultConfig(200_000, { tiers: { enabled: true, tier2Trigger: 3, tier3Trigger: 6 } });
     const t1 = ["b1", "b2", "b3", "b4"].map((id) => block(id, 1));
     assert.match(tierReadyHint(stateWith(t1), config), /distill tier-1 blocks b1\.\.b4/);
+    assert.doesNotMatch(tierReadyHint(stateWith(t1), config, true), /summary:/, "external mode asks only for the range");
     const t2 = Array.from({ length: 6 }, (_, i) => block(`b${i + 1}`, 2));
     assert.match(tierReadyHint(stateWith(t2), config), /condense tier-2 blocks b1\.\.b6/);
+    assert.doesNotMatch(tierReadyHint(stateWith(t2), config, true), /summary:/, "external mode asks only for the range");
 });

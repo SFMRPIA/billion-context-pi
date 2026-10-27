@@ -113,6 +113,26 @@ test("normalizeRanges accepts a single clean bare object", () => {
   assert.deepEqual(out[0], { startId: "m00001", endId: "m00010", summary: "s", topic: undefined });
 });
 
+test("normalizeRanges supplies the summary placeholder when external summarization is enabled", () => {
+  const out = normalizeRanges({ content: [{ startId: "m00001", endId: "m00010" }] }, true);
+  assert.ok(Array.isArray(out), `expected ranges, got error: ${out}`);
+  assert.equal(out[0].startId, "m00001");
+  assert.match(out[0].summary, /External summarizer will generate/);
+});
+
+test("normalizeRanges requires summaries when external summarization is disabled", () => {
+  const out = normalizeRanges({ content: [{ startId: "m00001", endId: "m00010" }] });
+  assert.equal(typeof out, "string");
+  assert.match(out, /summary/);
+});
+
+test("external-summary diagnostics omit the summary requirement", () => {
+  const out = normalizeRanges({ content: JSON.stringify([{ startId: "m00001" }]) }, true);
+  assert.equal(typeof out, "string");
+  assert.match(out, /fields startId, endId\./);
+  assert.doesNotMatch(out, /startId, endId, summary/);
+});
+
 test("normalizeRanges applies the top-level topic to re-wrapped ranges", () => {
   const out = normalizeRanges({ topic: "Auth", content: JSON.stringify({ startId: "m00001", endId: "m00005", summary: "s" }) });
   assert.ok(Array.isArray(out));

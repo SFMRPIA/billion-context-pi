@@ -10,7 +10,7 @@
 
 ## 配置文件位置
 
-配置从名为 `acp.json` 的 JSON 文件中读取。全局文件对所有项目生效；项目文件以**逐字段**方式覆盖全局文件（在项目文件中未设置的键仍然回退到全局值）。
+配置从名为 `acp.json` 的 JSON 文件中读取。全局文件对所有项目生效；项目文件以**逐字段**方式覆盖全局文件（在项目文件中未设置的键仍然回退到全局值）。唯一例外是顶层 `summarizer` 对象：项目文件一旦设置，就会整体替换全局对象。
 
 | 范围 | 路径 | 生效范围 |
 |------|------|----------|
@@ -173,6 +173,12 @@
 | `repetitionGuard.abort` | number | `5` | 🟢 ACTIVE | 连续字节级相同调用达到该次数后，拦截该调用（不执行）并中止本轮。必须大于 `warn`。 |
 | `degenerationGuard.enabled` | boolean | `true` | 🟢 ACTIVE | 启用单字符退化熔断。`false` 完全关闭。 |
 | `degenerationGuard.minRun` | number | `200` | 🟢 ACTIVE | 单 codepoint 连击达到该长度才判定为退化并折叠。小于 8 的值会被抬到 8。 |
+
+**外部摘要器键**
+
+| 键 | 类型 | 默认值 | 状态 | 说明 |
+|----|------|--------|------|------|
+| `summarizer` | object | 已禁用 | 🟢 ACTIVE | 可选：使用 Pi 模型注册表中的独立模型生成压缩摘要。项目级对象会整体替换全局 `summarizer` 对象。详见[外部摘要器](#外部摘要器)。 |
 
 **compress 键**
 
@@ -631,6 +637,34 @@
 - **说明：** 可选的 `customType` 白名单，细化 `countCustomMessages`：设置后（且 `countCustomMessages: true`），只有 `customType` 在列表内的注入 `custom_message` 条目才开启回合——进入 LLM 上下文但并非真实宿主回合的元数据注入（如 Prime 的 `harness_digest`、`ipython_state`）不再重置 nudge/重试账本（#578）。无 `customType` 的条目永不匹配；UI-only 类型（`acp-status`、`acp-export`、`acp-rule`）即使列出也保持排除。未开 `countCustomMessages: true` 时忽略；非法值（非数组、非字符串或空字符串成员）告警并回退到「全部注入类型都计数」。空数组表示显式「一个都不计」。上方示例即 Prime 的真实宿主回合类型集合。
 
 ---
+
+## 外部摘要器
+
+默认情况下，当前会话模型在现有 `compress` 工作流中撰写摘要。将 `summarizer.enabled` 设为 `true` 后，当前模型只选择范围和主题，由独立模型为每个范围撰写摘要。独立模型使用 Pi 现有的模型注册表与认证；本功能不会添加 provider 凭据或软件包。
+
+```json
+{
+  "summarizer": {
+    "enabled": true,
+    "model": "openrouter/openai/gpt-4.1",
+    "thinking": "low",
+    "fallbackModels": ["vendor/backup-model", "current"],
+    "timeoutMs": 120000
+  }
+}
+```
+
+| 字段 | 类型 | 默认值 | 规则 |
+|------|------|--------|------|
+| `summarizer.enabled` | boolean | `false` | 设为 `true` 时必须配置 `model`。禁用时继续使用原有的模型撰写摘要行为。 |
+| `summarizer.model` | string | 未设置 | 精确的 `provider/model-id`；按第一个 `/` 分割，因此 model ID 可以继续包含斜杠。必须能在 Pi 模型注册表中找到且已配置认证。 |
+| `summarizer.thinking` | string | provider 默认值 | 可选推理级别：`minimal`、`low`、`medium`、`high`、`xhigh` 或 `max`。 |
+| `summarizer.fallbackModels` | string[] | `["current"]` | 主模型失败后的有序回退列表。每项为精确的 `provider/model-id` 或 `current` 哨兵值。`current` 会在本次压缩调用开始时读取当前模型与 thinking level。`[]` 表示不回退。重复的 model/thinking 组合会跳过。 |
+| `summarizer.timeoutMs` | integer | `120000` | 每次尝试的超时时间，范围为 1000–600000 毫秒。 |
+
+每个范围按顺序尝试模型。失败的范围保持未压缩；同一批次中成功的范围仍可应用。用户取消时立即停止，不再回退。不会为了适配模型而静默截断源内容。摘要仅通过现有压缩内核提交，因此仍受其范围保护与解压恢复机制约束。更改后请重启 Pi，以重新加载 compress 工具提示元数据。
+
+项目级 `summarizer` 对象会整体替换全局对象，不会继承其中遗漏的子字段。例如，项目文件只设置 `enabled` 时，不会继承全局的 `model` 或 `fallbackModels`。
 
 ## 压缩调优
 

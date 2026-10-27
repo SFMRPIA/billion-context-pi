@@ -33,6 +33,19 @@ test("promptSections: string replaces, null removes, unknown keys ignored", () =
   assert.equal(ignored, base);
 });
 
+test("external summarizer mode overrides summary-writing prompts and custom section overrides", () => {
+  const prompt = buildAcpSystemPrompt(defaultPrompts, {
+    howToCompress: "Write summaries here",
+    tools: "Require summaries from the active model",
+    tier2: "Draft tier summaries",
+  }, true);
+  assert.ok(prompt.includes("The active model selects ranges and topics only"));
+  assert.ok(prompt.includes("Do not write replacement summaries"));
+  assert.ok(!prompt.includes("Write summaries here"));
+  assert.ok(!prompt.includes("Require summaries from the active model"));
+  assert.ok(!prompt.includes("Draft tier summaries"));
+});
+
 test("promptSections: one kernel tri-state contract for every section key — string replaces, null removes, junk dropped", () => {
   const s = sanitizePromptSections({ philosophy: "PHILO", howToCompress: "HOWTO", tier2: null, tier3: 7, compressPhilosophy: null });
   assert.deepEqual(s, { philosophy: "PHILO", howToCompress: "HOWTO", tier2: null });

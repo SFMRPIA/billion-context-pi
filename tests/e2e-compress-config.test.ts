@@ -86,18 +86,26 @@ test("e2e compress config: a single runtime resolves differently per model (prov
 
 test("e2e compress config: without a config file the kernel defaults apply", async () => {
     const savedHome = process.env.HOME;
+    const savedUserProfile = process.env.USERPROFILE;
     await withConfigDir(undefined, async (cwd) => {
         process.env.HOME = cwd;
-        const user = await loadUserConfig(cwd);
-        assert.deepEqual(user, {}, "no acp.json anywhere (HOME + cwd) → empty user config");
-        const runtime = createRuntime({});
-        await runtime.reloadConfig(cwd);
-        const cfg = runtime.configFor(ctxFor("anthropic", "claude-sonnet-4-5", 200_000));
-        assert.equal(cfg.nudge.maxContextLimitPct, 0.75, "kernel default maxContextLimitPct");
-        assert.equal(cfg.nudge.emergencyThresholdPct, 0.95, "kernel default emergencyThresholdPct");
-        assert.equal(cfg.nudge.growthFloor, 50000, "kernel default growthFloor");
+        process.env.USERPROFILE = cwd;
+        try {
+            const user = await loadUserConfig(cwd);
+            assert.deepEqual(user, {}, "no acp.json anywhere (HOME + cwd) → empty user config");
+            const runtime = createRuntime({});
+            await runtime.reloadConfig(cwd);
+            const cfg = runtime.configFor(ctxFor("anthropic", "claude-sonnet-4-5", 200_000));
+            assert.equal(cfg.nudge.maxContextLimitPct, 0.75, "kernel default maxContextLimitPct");
+            assert.equal(cfg.nudge.emergencyThresholdPct, 0.95, "kernel default emergencyThresholdPct");
+            assert.equal(cfg.nudge.growthFloor, 50000, "kernel default growthFloor");
+        } finally {
+            if (savedHome === undefined) delete process.env.HOME;
+            else process.env.HOME = savedHome;
+            if (savedUserProfile === undefined) delete process.env.USERPROFILE;
+            else process.env.USERPROFILE = savedUserProfile;
+        }
     });
-    process.env.HOME = savedHome;
 });
 
 // Behavioral: feed the real configFor() output into runtime.core.processTurn()

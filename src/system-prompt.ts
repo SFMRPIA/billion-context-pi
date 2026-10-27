@@ -86,7 +86,18 @@ export function sanitizePromptSections(raw: unknown): Partial<PiPromptSections> 
   return out;
 }
 
-export function buildAcpSystemPrompt(prompts: Prompts, sections?: Partial<PiPromptSections>): string {
+const EXTERNAL_SUMMARIZER_SECTIONS: Partial<PiPromptSections> = {
+  philosophy: "The active model selects ranges and topics only. A separate configured model writes replacement summaries.",
+  tools: `TOOLS\n\n- compress — Select message/block ranges and topics. When external summarization is enabled, omit summaries; the configured summarizer supplies them. Example: compress({ content: [{ startId: "m00150", endId: "m00220", topic: "Auth flow" }] }).\n- decompress — Retrieve exact details from a compressed range.\n- search_context — Search prior conversation and compressed summaries.\n- acp_status — Inspect context state and compressible ranges.\n- acp_cache — Inspect prompt-cache accounting.`,
+  whenToCompress: "Select ranges that are genuinely consumed and no longer needed for the current task step.",
+  whenNotToCompress: "Do not select content actively in use, important user messages, or protected tool output.",
+  howToCompress: "Do not write replacement summaries. Select valid start/end refs, add a short topic for each range, and let the configured external summarizer write the replacement.",
+  multiTierIntro: "For tiered compression, select block-ID boundaries and provide topics only. The external summarizer writes the new tier summary.",
+  tier2: "Select the tier-1 block range and provide a concise topic. Do not draft the tier-2 summary.",
+  tier3: "Select the tier-2 block range and provide a concise topic. Do not draft the tier-3 summary.",
+};
+
+export function buildAcpSystemPrompt(prompts: Prompts, sections?: Partial<PiPromptSections>, externalSummarizer = false): string {
   const ruleSlots: Record<string, string> = {
     philosophy: prompts.compressPhilosophy,
     howToCompress: prompts.howToCompressRules,
@@ -95,7 +106,8 @@ export function buildAcpSystemPrompt(prompts: Prompts, sections?: Partial<PiProm
   };
   const filled = SECTIONS.map(([key, text]) => [key, text || (ruleSlots[key] ?? text)] as const);
   const sanitized = sanitizePromptSections(sections);
-  return "\nACP context management\n\n" + applySectionOverrides(filled, sanitized as Record<string, SectionOverride>).join("\n\n") + "\n";
+  const effectiveSections = externalSummarizer ? { ...sanitized, ...EXTERNAL_SUMMARIZER_SECTIONS } : sanitized;
+  return "\nACP context management\n\n" + applySectionOverrides(filled, effectiveSections as Record<string, SectionOverride>).join("\n\n") + "\n";
 }
 
 export const ACP_DELEGATE_PROMPT = `

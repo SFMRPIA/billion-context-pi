@@ -29,6 +29,7 @@ import { sanitizeToolPairing } from "./tool-pair-sanitizer.js";
 import { countThinkingChars, dropCompressReasoning } from "./reasoning-drop.js";
 import { collapseAssistantDegeneration, degenerationNotice, lastAssistantRuns, resolveDegenerationGuard } from "./degeneration.js";
 import { buildAcpSystemPrompt, ACP_DELEGATE_PROMPT } from "./system-prompt.js";
+import { isExternalSummarizerEnabled } from "./summarizer.js";
 import { delegateStatusWidget } from "./fleet-widget.js";
 import { openFleetInspector } from "./fleet-inspector.js";
 import { applyStripImages } from "./strip-images.js";
@@ -125,8 +126,10 @@ export function createAcpExtension(adapter: AdapterConfig = {}): ExtensionFactor
     wireToolGuardrails(pi, runtime);
     wireOverflowSelfHeal(pi, runtime);
     wireThrottleRetry(pi, runtime);
-    const toolSurface = readToolSurfaceWithPacks(process.cwd());
-    pi.registerTool(makeCompressTool(runtime, toolSurface.compress));
+    const cwd = process.cwd();
+    const toolSurface = readToolSurfaceWithPacks(cwd);
+    const externalSummarizer = userSummarizerEnabled(cwd, runtime.adapter.summarizer?.enabled === true);
+    pi.registerTool(makeCompressTool(runtime, externalSummarizer ? undefined : toolSurface.compress));
     pi.registerTool(makeDecompressTool(runtime, toolSurface.decompress));
     pi.registerTool(makeSearchTool(runtime, toolSurface.search_context));
     pi.registerTool(makeStatusTool(runtime, toolSurface.acp_status));
@@ -148,6 +151,23 @@ export default createAcpExtension();
 // small to handle ACP). Project acp.json overrides global; only a literal
 // enabled:true/false counts; missing files mean "not disabled", while bad
 // files are repaired when possible and otherwise warned about loudly (#467).
+function userSummarizerEnabled(cwd: string, fallback: boolean): boolean {
+  let enabled = fallback;
+  for (const file of acpJsonFiles(cwd)) {
+    let text: string;
+    try {
+      text = readFileSync(file, "utf8");
+    } catch {
+      continue;
+    }
+    const parsed = parseAcpJson(file, text);
+    if (parsed.status === "failed" || !parsed.value || !Object.hasOwn(parsed.value, "summarizer")) continue;
+    const value = parsed.value.summarizer;
+    enabled = Boolean(value && typeof value === "object" && !Array.isArray(value) && (value as Record<string, unknown>).enabled === true);
+  }
+  return enabled;
+}
+
 function userConfigDisabled(cwd: string): boolean {
   let disabled: boolean | undefined;
   for (const file of acpJsonFiles(cwd)) {
@@ -697,7 +717,7 @@ function wireContextTransform(pi: ExtensionAPI, runtime: AcpRuntime, standDownIf
         prunedMsgs: coreMessages.length - turn.messages.length + turn.messages.filter((m) => m.id.startsWith("acp_summary")).length,
         nudgeShouldInject: turn.nudge?.shouldInject ?? false,
         nudgeReason: turn.nudge?.reason ?? null,
-        nudgeVoice: turn.nudge ? renderNudgeText(turn.nudge, runtime.prompts, activeNudgeSections(runtime, ctx)).voice : null,
+        nudgeVoice: turn.nudge ? renderNudgeText(turn.nudge, promptsForSummarizerMode(runtime), activeNudgeSections(runtime, ctx)).voice : null,
       nudgePct: turn.nudge ? Math.round(turn.nudge.contextUsage * 100) : null,
       nudgeTier: turn.nudge?.tier ?? null,
       nudgeCompressibleCount: turn.nudge?.compressibleRanges.length ?? 0,
@@ -850,10 +870,11 @@ function wireContextTransform(pi: ExtensionAPI, runtime: AcpRuntime, standDownIf
       const reInjectReady = shownAt === undefined || tokenCount - shownAt >= reInjectFloor;
       const alreadyShown = retryCapped || (!emergency && runtime.nudgeShownFor(sid, turnKey) && !reInjectReady);
       if (!alreadyShown) {
-        rebuilt.push(nudgeMessage(turn.nudge, turn.state.blocks.filter((b) => b.active), runtime.prompts, activeNudgeSections(runtime, ctx)));
-        const rendered = renderNudgeText(turn.nudge, runtime.prompts, activeNudgeSections(runtime, ctx));
+        rebuilt.push(nudgeMessage(turn.nudge, turn.state.blocks.filter((b) => b.active), promptsForSummarizerMode(runtime), activeNudgeSections(runtime, ctx)));
+        const rendered = renderNudgeText(turn.nudge, promptsForSummarizerMode(runtime), activeNudgeSections(runtime, ctx));
         const top = [...turn.nudge.compressibleRanges].sort((a, b) => b.tokens - a.tokens)[0];
-        const example = top ? `\n\nExample: compress({ content: [{ startId: "${top.startRef}", endId: "${top.endRef}", summary: "..." }] })` : "";
+        const summaryArg = isExternalSummarizerEnabled(runtime.adapter) ? "" : ', summary: "..."';
+        const example = top ? `\n\nExample: compress({ content: [{ startId: "${top.startRef}", endId: "${top.endRef}"${summaryArg} }] })` : "";
         if (emergency) {
           logWarn("nudge", { sid: ctx.sessionManager.getSessionId(), event: "emergency-inject", pct: Math.round(turn.nudge.contextUsage * 100), voice: rendered.voice, compressible: turn.nudge.compressibleRanges.length });
         }
@@ -978,18 +999,37 @@ function wireSystemPrompt(pi: ExtensionAPI, runtime: AcpRuntime): void {
       runtime.setPrompts(defaultPrompts);
     }
     const delegate = resolveDelegate(runtime.adapter).enabled && !runtime.delegateStoodDown;
-    const acp = buildAcpSystemPrompt(runtime.prompts, merged.promptSections);
+    const acp = buildAcpSystemPrompt(runtime.prompts, merged.promptSections, isExternalSummarizerEnabled(runtime.adapter));
     const delegateText = merged.delegatePrompt !== undefined ? merged.delegatePrompt : ACP_DELEGATE_PROMPT;
     const prompt = delegate && delegateText !== null ? `${acp}\n${delegateText}` : acp;
     return { systemPrompt: formatSystemPromptForEvent(event.systemPrompt, prompt) };
   });
 }
 
+function promptsForSummarizerMode(runtime: AcpRuntime): Prompts {
+  if (!isExternalSummarizerEnabled(runtime.adapter)) return runtime.prompts;
+  return {
+    ...runtime.prompts,
+    compressPhilosophy: "The active model selects ranges and topics only; a separate configured model writes replacement summaries.",
+    howToCompressRules: "Select valid range boundaries and topics only. Do not draft replacement summaries.",
+    tier2DistillRules: "Select tier-1 block boundaries and topics only. Do not draft tier-2 summaries.",
+    tier3CondenseRules: "Select tier-2 block boundaries and topics only. Do not draft tier-3 summaries.",
+  };
+}
+
 function activeNudgeSections(runtime: AcpRuntime, ctx?: ExtensionContext): NudgeSectionsConfig {
   const m = ctx?.model as { provider?: string; id?: string } | undefined;
   const cwd = ctx?.cwd ?? process.cwd();
   const pack = resolveActivePack(runtime.adapter, cwd, m?.provider, m?.id);
-  return mergeSurface(pack, runtime.adapter).nudgeSections;
+  const sections = mergeSurface(pack, runtime.adapter).nudgeSections;
+  if (!isExternalSummarizerEnabled(runtime.adapter)) return sections;
+  return {
+    ...sections,
+    efficiencyNote: "Select ranges and topics only; the configured external summarizer writes the summaries.",
+    emergencyHeader: "Context is critically full. Select a compressible range now; do not write its summary.",
+    t2Guidance: "Tier 2: select the source block range and topic only; the external summarizer writes the distillation.",
+    t3Guidance: "Tier 3: select the source block range and topic only; the external summarizer writes the condensation.",
+  };
 }
 
 // Context-overflow self-heal: when the model API rejects a request because the

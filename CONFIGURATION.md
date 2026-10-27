@@ -10,7 +10,7 @@ Configuration is layered: environment variables take the highest precedence, fol
 
 ## Config file locations
 
-Settings are read from JSON files named `acp.json`. The global file applies to every project; a project file overrides the global one on a **per-field** basis (individual keys you do not set in the project file still fall back to the global value).
+Settings are read from JSON files named `acp.json`. The global file applies to every project; a project file overrides the global one on a **per-field** basis (individual keys you do not set in the project file still fall back to the global value). The top-level `summarizer` object is the exception: when set in a project file, it replaces the global object as a whole.
 
 | Scope | Path | Applies to |
 |-------|------|------------|
@@ -174,6 +174,12 @@ All keys below are currently **ACTIVE**.
 | `repetitionGuard.abort` | number | `5` | 🟢 ACTIVE | Consecutive byte-identical calls before the call is blocked (not executed) and the turn is aborted. Must exceed `warn`. |
 | `degenerationGuard.enabled` | boolean | `true` | 🟢 ACTIVE | Enable the degenerate-repeat guard. `false` disables it entirely. |
 | `degenerationGuard.minRun` | number | `200` | 🟢 ACTIVE | Minimum length of a single-codepoint run before it is treated as degeneration and collapsed. Values below 8 are raised to 8. |
+
+**External summarizer key**
+
+| Key | Type | Default | Status | Description |
+|-----|------|---------|--------|-------------|
+| `summarizer` | object | disabled | 🟢 ACTIVE | Optionally generate compression summaries with a separate Pi-registry model. The project-level object replaces the global `summarizer` object as a whole. See [External summarizer](#external-summarizer). |
 
 **Compression keys**
 
@@ -635,6 +641,34 @@ The `hostSession` key controls **turn-boundary detection** for hosts that run se
 - **Description:** Optional `customType` allowlist refining `countCustomMessages`: when set (with `countCustomMessages: true`), only injected `custom_message` entries whose `customType` is listed start a turn — metadata injections that enter LLM context without being a real host turn (e.g. Prime's `harness_digest`, `ipython_state`) no longer reset nudge/retry accounting (#578). Entries without a `customType` never match; UI-only types (`acp-status`, `acp-export`, `acp-rule`) stay excluded even when listed. Ignored unless `countCustomMessages: true`; malformed values (non-array, non-string or empty-string members) warn and fall back to "all injected types count". An empty array is explicit "count none". Example above is Prime's set of genuine host-turn types.
 
 ---
+
+## External Summarizer
+
+By default, the active model writes summaries as part of the existing `compress` workflow. Set `summarizer.enabled` to `true` to make the active model select ranges/topics while a separate model writes each summary. The separate model uses Pi's existing model registry and authentication; this feature adds no provider credentials or packages.
+
+```json
+{
+  "summarizer": {
+    "enabled": true,
+    "model": "openrouter/openai/gpt-4.1",
+    "thinking": "low",
+    "fallbackModels": ["vendor/backup-model", "current"],
+    "timeoutMs": 120000
+  }
+}
+```
+
+| Field | Type | Default | Rules |
+|-------|------|---------|-------|
+| `summarizer.enabled` | boolean | `false` | When `true`, `model` is required. When disabled, compression keeps its existing model-written-summary behavior. |
+| `summarizer.model` | string | unset | Exact `provider/model-id`; split at the first `/`, so model IDs may contain further slashes. Must be available in Pi's model registry with configured authentication. |
+| `summarizer.thinking` | string | provider default | Optional reasoning level: `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`. |
+| `summarizer.fallbackModels` | string[] | `["current"]` | Ordered fallbacks after the primary model. Entries are exact `provider/model-id` references or the `current` sentinel. `current` snapshots the active model and thinking level when the compression call starts. `[]` disables fallback. Duplicate model/thinking pairs are skipped. |
+| `summarizer.timeoutMs` | integer | `120000` | Per-attempt timeout from `1000` through `600000` ms. |
+
+Generation is sequential per range. A failed range is left uncompressed; successful ranges in the same batch may still be applied. Cancellation stops immediately without fallback. Source content is not silently truncated to fit a model. Summaries are committed only through the existing compression kernel, so its range guards and decompression recovery remain in force. Restart Pi after changing the setting so the compress tool's prompt metadata is reloaded.
+
+A project-level `summarizer` object replaces the global object wholesale (it does not inherit omitted subfields). For example, a project object containing only `enabled` does not inherit the global `model` or `fallbackModels`.
 
 ## Compression Tuning
 
